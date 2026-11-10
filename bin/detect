@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -f "$1/Gemfile" ]]; then
+  printf '%s\n' 'GitHub App authentication for private gems'
+else
+  exit 1
+fi

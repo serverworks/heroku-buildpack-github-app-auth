@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# 内部用: credential helper が stdout の token を捕捉し、Git にだけ渡す。
+set +x
+set -euo pipefail
+
+env_dir="${1:?Heroku ENV_DIR is required}"
+IFS=',' read -r -a repositories <<< "${PRIVATE_GEMS_APP_REPOSITORIES:?PRIVATE_GEMS_APP_REPOSITORIES is not set}"
+repository="${repositories[0]}"
+client_id="$(cat "$env_dir/PRIVATE_GEMS_APP_CLIENT_ID")"
+private_key_base64="$(cat "$env_dir/PRIVATE_GEMS_APP_PRIVATE_KEY_BASE64")"
+if [[ ! "$client_id" =~ ^[A-Za-z0-9.]+$ ]]; then
+  printf '%s\n' 'Invalid PRIVATE_GEMS_APP_CLIENT_ID' >&2
+  exit 1
+fi
+
+base64url() {
+  openssl base64 -A | tr '+/' '-_' | tr -d '='
+}
+
+now="$(date +%s)"
+header="$(printf '%s' '{"alg":"RS256","typ":"JWT"}' | base64url)"
+# GitHub の推奨に従い iat を60秒戻し、JWT の有効期限は上限10分より短くする。
+payload="$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((now - 60))" "$((now + 540))" "$client_id" | base64url)"
+# Ruby buildpack より前なので gem に依存しない。秘密鍵はパイプ経由で OpenSSL に渡す。
+if ! signature="$(printf '%s' "${header}.${payload}" |
+  openssl dgst -sha256 -binary -sign <(printf '%s' "$private_key_base64" | base64 -d 2>/dev/null) 2>/dev/null |
+  base64url)"; then
+  printf '%s\n' 'Failed to sign GitHub App JWT' >&2
+  exit 1
+fi
+unset private_key_base64
+jwt="${header}.${payload}.${signature}"
+
+github_api() {
+  # Authorization を argv やファイルに載せない。.curlrc による意図しないログ出力も避ける。
+  printf 'header = "Authorization: Bearer %s"\n' "$jwt" |
+    curl --disable --silent --show-error --fail --proto '=https' \
+      --connect-timeout 10 --max-time 30 --config - \
+      --header 'Accept: application/vnd.github+json' \
+      --header 'X-GitHub-Api-Version: 2022-11-28' \
+      "$@"
+}
+
+# Heroku のビルド時に利用できる Python 3 で JSON のトップレベルの id を読む。
+if ! installation_id="$(github_api "https://api.github.com/repos/${repository}/installation" |
+  python3 -c '
+import json, sys
+try:
+    value = json.load(sys.stdin)["id"]
+    if type(value) is not int or value <= 0:
+        raise ValueError()
+except (ValueError, KeyError, TypeError):
+    raise SystemExit("Invalid GitHub App installation response")
+print(value)
+')"; then
+  printf '%s\n' 'GitHub App installation lookup failed' >&2
+  exit 1
+fi
+
+# 1つの App installation で許可した複数リポジトリを、同じ token の読み取り範囲にする。
+token_request="$(printf '%s' "$PRIVATE_GEMS_APP_REPOSITORIES" | python3 -c '
+import json, sys
+repositories = [repository.split("/", 1)[1] for repository in sys.stdin.read().split(",")]
+print(json.dumps({"repositories": repositories, "permissions": {"contents": "read"}}))
+')"
+if ! token="$(github_api --request POST \
+  --header 'Content-Type: application/json' \
+  --data "$token_request" \
+  "https://api.github.com/app/installations/${installation_id}/access_tokens" |
+  python3 -c '
+import json, sys
+try:
+    value = json.load(sys.stdin)["token"]
+    if not isinstance(value, str) or not value or "\r" in value or "\n" in value:
+        raise ValueError()
+except (ValueError, KeyError, TypeError):
+    raise SystemExit("Invalid GitHub App token response")
+print(value)
+')"; then
+  printf '%s\n' 'GitHub App installation token request failed' >&2
+  exit 1
+fi
+
+printf '%s\n' "$token"

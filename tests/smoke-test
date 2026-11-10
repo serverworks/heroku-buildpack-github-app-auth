@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# smoke-in-stack から Docker 内で実行する。stdin は PEM 秘密鍵。
+set +x
+set -euo pipefail
+umask 077
+
+smoke_dir="$(mktemp -d)"
+trap 'rm -rf "$smoke_dir"' EXIT
+buildpack_dir="$(cd "$(dirname "$0")/.." && pwd)"
+cp -R "$buildpack_dir" "$smoke_dir/buildpack"
+mkdir "$smoke_dir/build" "$smoke_dir/cache" "$smoke_dir/env"
+printf '%s\n' 'source "https://rubygems.org"' > "$smoke_dir/build/Gemfile"
+printf '%s' "${PRIVATE_GEMS_APP_CLIENT_ID:?}" > "$smoke_dir/env/PRIVATE_GEMS_APP_CLIENT_ID"
+printf '%s' "${PRIVATE_GEMS_APP_REPOSITORIES:?}" > "$smoke_dir/env/PRIVATE_GEMS_APP_REPOSITORIES"
+base64 -w0 > "$smoke_dir/env/PRIVATE_GEMS_APP_PRIVATE_KEY_BASE64"
+
+"$smoke_dir/buildpack/bin/detect" "$smoke_dir/build" >/dev/null
+"$smoke_dir/buildpack/bin/compile" "$smoke_dir/build" "$smoke_dir/cache" "$smoke_dir/env"
+
+# ローカルの Git 設定や資格情報に成功を依存させず、buildpack の export だけを使う。
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+source "$smoke_dir/buildpack/export"
+IFS=',' read -r -a repositories <<< "$PRIVATE_GEMS_APP_REPOSITORIES"
+repository_index=0
+for repository in "${repositories[@]}"; do
+  repository_index=$((repository_index + 1))
+  # URL や refs も出力に載せず、成功した件数だけ表示する。
+  if ! git ls-remote --exit-code "https://github.com/${repository}.git" HEAD \
+    > "$smoke_dir/refs" 2> "$smoke_dir/git-error"; then
+    printf 'repository %d: git ls-remote failed; check App installation, read permissions and connectivity\n' "$repository_index" >&2
+    exit 1
+  fi
+  printf 'repository %d: git ls-remote succeeded\n' "$repository_index"
+done
+
+printf 'Smoke test passed: %d repositories\n' "$repository_index"

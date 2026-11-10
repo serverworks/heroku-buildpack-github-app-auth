@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set +x
+set -euo pipefail
+
+private_key_path="${1:?Specify a local PEM private key path}"
+stack_version="${2:-24}"
+case "$stack_version" in
+  22|24|26) ;;
+  *) printf '%s\n' 'Specify 22, 24 or 26' >&2; exit 1 ;;
+esac
+[[ -r "$private_key_path" ]] || { printf '%s\n' 'Private key file is not readable' >&2; exit 1; }
+: "${PRIVATE_GEMS_APP_CLIENT_ID:?Set PRIVATE_GEMS_APP_CLIENT_ID}"
+: "${PRIVATE_GEMS_APP_REPOSITORIES:?Set PRIVATE_GEMS_APP_REPOSITORIES}"
+buildpack_dir="$(cd "$(dirname "$0")/.." && pwd)"
+
+# 鍵は Docker の stdin に渡す。ホスト上のファイルや認証設定はマウントしない。
+# ENV_DIR に作る鍵の Base64 も tmpfs 上だけに置き、コンテナ終了時に破棄する。
+docker run --rm -i --platform linux/amd64 --read-only \
+  --tmpfs /tmp:rw,exec,nosuid,nodev \
+  --mount "type=bind,src=${buildpack_dir},dst=/buildpack,readonly" \
+  --workdir /buildpack --env "STACK=heroku-${stack_version}" \
+  --env PRIVATE_GEMS_APP_CLIENT_ID --env PRIVATE_GEMS_APP_REPOSITORIES \
+  "heroku/heroku:${stack_version}-build" \
+  bash tests/smoke-test < "$private_key_path"

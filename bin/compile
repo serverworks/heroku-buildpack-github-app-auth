@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+buildpack_dir="$(cd "$(dirname "$0")/.." && pwd)"
+env_dir="$(cd "$3" && pwd)"
+
+for key in PRIVATE_GEMS_APP_CLIENT_ID PRIVATE_GEMS_APP_PRIVATE_KEY_BASE64 PRIVATE_GEMS_APP_REPOSITORIES; do
+  if [[ ! -s "$env_dir/$key" ]]; then
+    printf 'Missing Config Var: %s\n' "$key" >&2
+    exit 1
+  fi
+done
+
+repositories="$(cat "$env_dir/PRIVATE_GEMS_APP_REPOSITORIES")"
+# 空要素を先に拒否する。Bash の read -a は末尾の空要素を保持しないため。
+if [[ -z "$repositories" || "$repositories" == ,* || "$repositories" == *, || "$repositories" == *,,* ||
+  "$repositories" == *$'\n'* || "$repositories" == *$'\r'* ]]; then
+  printf '%s\n' 'Invalid PRIVATE_GEMS_APP_REPOSITORIES (expected comma-separated OWNER/REPOSITORY)' >&2
+  exit 1
+fi
+IFS=',' read -r -a repository_list <<< "$repositories"
+repository_owner="${repository_list[0]%%/*}"
+for repository in "${repository_list[@]}"; do
+  # この値は API のパスと Git 設定キーに使うため、OWNER/REPOSITORY だけを許可する。
+  if [[ ! "$repository" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ ||
+    "${repository#*/}" == . || "${repository#*/}" == .. || "$repository" == *.git ]]; then
+    printf '%s\n' 'Invalid PRIVATE_GEMS_APP_REPOSITORIES (expected comma-separated OWNER/REPOSITORY)' >&2
+    exit 1
+  fi
+  # installation token は別 owner の installation をまたげない。
+  if [[ "${repository%%/*}" != "$repository_owner" ]]; then
+    printf '%s\n' 'PRIVATE_GEMS_APP_REPOSITORIES must use one owner (one GitHub App installation)' >&2
+    exit 1
+  fi
+done
+
+for command in git curl openssl python3 base64; do
+  if ! command -v "$command" >/dev/null; then
+    printf 'Required command is unavailable: %s\n' "$command" >&2
+    exit 1
+  fi
+done
+
+# export は後続 buildpack の環境を設定する。slug とキャッシュには何も置かない。
+# 秘密鍵の値は展開せず、ENV_DIR のパスと認証対象だけを引き継ぐ。
+{
+  printf 'export PRIVATE_GEMS_APP_ENV_DIR=%q\n' "$env_dir"
+  printf 'export PRIVATE_GEMS_APP_REPOSITORIES=%q\n' "$repositories"
+  printf 'source %q\n' "$buildpack_dir/lib/export.sh"
+} > "$buildpack_dir/export"
+
+printf '%s\n' '-----> GitHub App credential helper configured (token is issued on demand)'

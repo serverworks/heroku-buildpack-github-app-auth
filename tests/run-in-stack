@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+stack_version="${1:-24}"
+case "$stack_version" in
+  22|24|26) ;;
+  *) printf '%s\n' 'Specify 22, 24 or 26' >&2; exit 1 ;;
+esac
+buildpack_dir="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Cedar の classic build 環境に合わせて amd64 を使う。
+# ソース以外はマウントせず、テスト内の GitHub API は偽応答のため通信を無効にする。
+docker run --rm --platform linux/amd64 --network none \
+  --mount "type=bind,src=${buildpack_dir},dst=/buildpack,readonly" \
+  --workdir /buildpack --env "STACK=heroku-${stack_version}" \
+  "heroku/heroku:${stack_version}-build" \
+  bash -c '
+    set -euo pipefail
+    for dependency in bash git curl openssl python3 base64; do
+      command -v "$dependency" >/dev/null
+    done
+    exec python3 -B -m unittest discover -s tests -v
+  '
